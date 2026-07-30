@@ -17,79 +17,53 @@ class UpdatingFutureRecommendations {
 
   async getYearsGreaterThanGivenYear(fieldID, year) {
     const years = await this.cropRepository.find({
-      where: {
-        FieldID: fieldID,
-        Year: MoreThan(year), // Fetch records with Year greater than the provided year
-      },
+      where: { FieldID: fieldID, Year: MoreThan(year) },
       select: ["Year"],
     });
 
-    // Extract and return unique years
-    return years.map((record) => record.Year);
-  }
-  async updateRecommendationsForField(fieldID, year, request, userId) {
-    // Fetch all years greater than the provided year for the given FieldID
-    const yearsGreaterThanGivenYear = await this.getYearsGreaterThanGivenYear(
-      fieldID,
-      year,
-    );
-    const allYearsTogether = [year, ...yearsGreaterThanGivenYear];
-    this.processYearsInBackground(fieldID, allYearsTogether, request, userId);
+    // Dedup — a field can have multiple crop records in the same year
+    // (e.g. main + cover crop), which would otherwise cause that year
+    // to be regenerated redundantly multiple times.
+    return [...new Set(years.map((record) => record.Year))];
   }
 
-  async processYearsInBackground(fieldID, years, request, userId) {
+  async updateRecommendationsForField(fieldID, year, ctx, userId) {
+    const yearsGreaterThanGivenYear = await this.getYearsGreaterThanGivenYear(fieldID, year);
+    const allYearsTogether = [...new Set([year, ...yearsGreaterThanGivenYear])];
+
+    await this.processYearsInBackground(fieldID, allYearsTogether, ctx, userId);
+  }
+
+  async processYearsInBackground(fieldID, years, ctx, userId) {
     for (const yearToSave of years) {
       try {
-        // Check if FieldID and Year combination already exists
         const existingEntry = await this.farmExistRepository.findOne({
           where: { FieldID: fieldID, Year: yearToSave },
         });
 
-        // If it doesn't exist, save it
-        if (existingEntry) {
-          console.log(
-            `Entry for FieldID: ${fieldID}, Year: ${yearToSave} already exists`,
-          );
-        } else {
-          await this.farmExistRepository.save({
-            FieldID: fieldID,
-            Year: yearToSave,
-          });
-          console.log(
-            `Saved entry for FieldID: ${fieldID}, Year: ${yearToSave}`,
-          );
+        if (!existingEntry) {
+          await this.farmExistRepository.save({ FieldID: fieldID, Year: yearToSave });
+          console.log(`Saved entry for FieldID: ${fieldID}, Year: ${yearToSave}`);
         }
       } catch (error) {
-        console.error(
-          `Error saving entry for FieldID: ${fieldID}, Year: ${yearToSave}`,
-          error,
-        );
+        console.error(`Error saving entry for FieldID: ${fieldID}, Year: ${yearToSave}`, error);
       }
     }
 
-    // If there are remaining years, process them in the background
-    if (years.length > 0) {
-      console.log("Processing the following years in background:", years);
-      for (const yearToUpdate of years) {
-        try {
-          // Call the updateRecommendationAndOrganicManure for each remaining year
-          await this.updateRecommendationAndOrganicManure(
-            fieldID,
-            yearToUpdate,
-            request,
-            userId,
-          );
-          console.log(`Successfully processed year ${yearToUpdate}`);
-        } catch (error) {
-          console.error(`Error processing year ${yearToUpdate}:`, error);
-        }
+    // Every year with a plan gets regenerated — this is the business
+    // requirement (current year + all future years with plans), not
+    // a bug — do not filter this down.
+    for (const yearToUpdate of years) {
+      try {
+        await this.updateRecommendationAndOrganicManure(fieldID, yearToUpdate, ctx, userId);
+        console.log(`Successfully processed year ${yearToUpdate} for FieldID ${fieldID}`);
+      } catch (error) {
+        console.error(`Error processing year ${yearToUpdate} for FieldID ${fieldID}`, error);
       }
-    } else {
-      console.log("No years greater than the given year were found.");
     }
   }
 
-  async updateRecommendationAndOrganicManure(fieldID, year, request, userId) {
+  async updateRecommendationAndOrganicManure(fieldID, year, ctx, userId) {
     return AppDataSource.transaction(async (transactionalManager) => {
       const newOrganicManure = null;
       await this.generateRecommendations.generateRecommendations(
@@ -97,13 +71,13 @@ class UpdatingFutureRecommendations {
         year,
         newOrganicManure,
         transactionalManager,
-        request,
+        ctx,
         userId
       );
 
       await transactionalManager.delete(InprogressCalculationsEntity, {
         FieldID: fieldID,
-        Year: year
+        Year: year,
       });
       console.log(`Deleted entry for FieldID: ${fieldID}, Year: ${year}`);
     });
